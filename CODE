@@ -1,0 +1,267 @@
+from datetime import datetime
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Dropout, Dense, LSTM, SimpleRNN, GRU, Conv1D
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
+import math
+from Loss_LSTM import custom_loss
+
+
+def get_model(pre_len, LSTM_Layer1, LSTM_Layer2):
+    model = tf.keras.Sequential([
+        # Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', input_shape=(input_size, 1)),
+        LSTM_Layer1,
+        Dropout(0.2),
+        LSTM_Layer2,
+        Dropout(0.2),
+        Dense(pre_len)
+    ])
+    return model
+
+
+model_setting = {
+
+}
+
+
+def output_len(setting):
+    if setting['continuous_output_sequence']:
+        return setting['pre_len']
+    return 1
+
+
+# setting = {
+#     'train_size': 0.8,
+#     'epochs': 100,
+#     'input_size': 60,
+#     'batch_size': 32,
+#     'pre_len': 6,
+#     'fileName': "o2_i600s_w10_s1_fmean",
+#     'model_name': 'lstm',
+#     'checkpoint_root_dir': './checkpoint',
+#     'true_epochs': 100,
+#     'data_root_dir': './data',
+#     'train_data_mode': 'pre',
+#     'train_set_cols': [1],
+#     'test_set_cols': [1],
+#     'continuous_output_sequence': True,
+# }
+
+
+def models(setting):
+    return {
+        'lstm': get_model(pre_len=output_len(setting),
+                          LSTM_Layer1=LSTM(units=80, return_sequences=True,
+                                           input_shape=(setting['input_size'], len(setting['train_set_cols']))),
+                          LSTM_Layer2=LSTM(units=100)),
+        'rnn': tf.keras.Sequential([
+            SimpleRNN(80, return_sequences=True),
+            Dropout(0.2),
+            SimpleRNN(100),
+            Dropout(0.2),
+            Dense(output_len(setting))
+        ]),
+        'cnn-lstm': tf.keras.Sequential([
+            Conv1D(filters=32, kernel_size=3, padding='same', activation='relu',
+                   input_shape=(setting['input_size'], len(setting['train_set_cols']))),
+            LSTM(units=80, return_sequences=True,
+                 input_shape=(setting['input_size'], len(setting['train_set_cols']))),
+            Dropout(0.2),
+            LSTM(units=100),
+            Dropout(0.2),
+            Dense(output_len(setting))
+        ]),
+        'gru': tf.keras.Sequential([
+            GRU(units=80, return_sequences=True,
+                input_shape=(setting['input_size'], len(setting['train_set_cols']))),
+            Dropout(0.2),
+            GRU(units=100),
+            Dropout(0.2),
+            Dense(output_len(setting))
+        ]),
+    }
+
+
+
+def get_data(training_set, test_set, setting):
+    input_size = setting['input_size']
+    pre_len = setting['pre_len']
+    # normalization
+    sc = MinMaxScaler(feature_range=(0, 1))
+    training_set_scaled = sc.fit_transform(training_set)
+    test_set = sc.transform(test_set)
+
+    x_train = []
+    y_train = []
+    x_test = []
+    y_test = []
+
+    for i in range(input_size, len(training_set_scaled) - pre_len):
+        x_train.append(training_set_scaled[i - input_size:i, 0])
+        label_start = i
+        label_end = i + pre_len
+        if not setting['continuous_output_sequence']:
+            label_end = i + pre_len
+            label_start = label_end - 1
+        y_train.append(training_set_scaled[label_start:label_end, 0])
+    # Scramble the training set
+    np.random.seed(7)
+    np.random.shuffle(x_train)
+    np.random.seed(7)
+    np.random.shuffle(y_train)
+    tf.random.set_seed(7)
+    # Change the training set from list format to array format
+    x_train, y_train = np.array(x_train), np.array(y_train)
+    x_train = np.reshape(x_train, (x_train.shape[0], input_size, 1))
+
+    y_test_continuous_seq = []
+    for i in range(input_size, len(test_set) - pre_len):
+        x_test.append(test_set[i - input_size:i, 0])
+        label_start = i
+        label_end = i + pre_len
+        y_test_continuous_seq.append(test_set[label_start:label_end, 0])
+        if not setting['continuous_output_sequence']:
+            label_end = i + pre_len
+            label_start = label_end - 1
+        y_test.append(test_set[label_start:label_end, 0])
+    x_test, y_test, y_test_continuous_seq = np.array(x_test), np.array(y_test), np.array(y_test_continuous_seq)
+    x_test = np.reshape(x_test, (x_test.shape[0], input_size, 1))
+    setting['y_test_continuous_seq'] = y_test_continuous_seq
+    if 'shuffle_all' in setting and setting['shuffle_all']:
+    #     Merge training sets and tests
+        x = np.concatenate((x_train, x_test), axis=0)
+        y = np.concatenate((y_train, y_test), axis=0)
+        # Scramble the training and testing sets
+        np.random.seed(7)
+        np.random.shuffle(x)
+        np.random.seed(7)
+        np.random.shuffle(y)
+    #     Separate the training and testing sets
+        x_train = x[:len(x_train)]
+        x_test = x[len(x_train):]
+        y_train = y[:len(y_train)]
+        y_test = y[len(y_train):]
+    return x_train, y_train, x_test, y_test, sc, test_set
+
+
+def train(setting):
+    model = setting['model']
+    x_train = setting['x_train']
+    y_train = setting['y_train']
+    x_test = setting['x_test']
+    y_test = setting['y_test']
+
+    print('x_train.shape', x_train.shape)
+    print('y_train.shape', y_train.shape)
+    print('x_test.shape', x_test.shape)
+    print('y_test.shape', y_test.shape)
+
+    if setting['cp_callback'] is None:
+        preprocess(setting)
+
+    cp_callback = setting['cp_callback']
+    true_epochs = setting['true_epochs']
+
+    history = model.fit(x_train, y_train, setting['batch_size'], epochs=true_epochs, validation_data=(x_test, y_test),
+                        validation_freq=1,
+                        callbacks=[cp_callback])
+
+    model.summary()
+
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+
+    return loss, val_loss
+
+
+def preprocess(setting):
+    # get data
+    file_path = os.path.join(setting['data_root_dir'], setting['fileName'] + '.csv')
+    setting['data_set'] = pd.read_csv(file_path)
+    train_size = setting['train_size']
+    data_set = setting['data_set']
+    if setting['train_data_mode'] == 'pre':
+        training_set = data_set.iloc[0:int(len(data_set) * train_size), setting['train_set_cols']].values
+        test_set = data_set.iloc[int(len(data_set) * train_size):, setting['test_set_cols']].values
+        setting['test_set'] = test_set
+        setting['train_set'] = training_set
+    elif setting['train_data_mode'] == 'post':
+        k = int(len(data_set) * train_size)
+        training_set = data_set.iloc[len(data_set)-k:, setting['train_set_cols']].values
+        test_set = data_set.iloc[0:len(data_set)-k, setting['test_set_cols']].values
+        setting['test_set'] = test_set
+        setting['train_set'] = training_set
+
+    x_train, y_train, x_test, y_test, sc, test_set = get_data(setting['train_set'], setting['test_set'], setting)
+    setting['x_train'] = x_train
+    setting['y_train'] = y_train
+    setting['x_test'] = x_test
+    setting['y_test'] = y_test
+    setting['sc'] = sc
+    setting['test_set'] = test_set
+
+    # modeling
+    setting['model'] = models(setting)[setting['model_name']]
+    model = setting['model']
+    setting['checkpoint_save_path'] = os.path.join(setting['checkpoint_root_dir'],
+                                                   f"{setting['model_name']}_i{setting['input_size']}_o{setting['pre_len']}",
+                                                   f"{setting['fileName']}",
+                                                   f"{setting['fileName']}.ckpt")
+    checkpoint_save_path = setting['checkpoint_save_path']
+    if 'loss' in setting and setting['loss'] == 'cost':
+        model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
+                      loss=custom_loss)
+    else:
+        model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
+                    loss='mean_squared_error')
+    #
+    if os.path.exists(checkpoint_save_path + '.index'):
+        print('-------------load the model-----------------')
+        model.load_weights(checkpoint_save_path)
+    cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_save_path,
+                                                     save_weights_only=True,
+                                                     save_best_only=True,
+                                                     monitor='val_loss')
+    setting['cp_callback'] = cp_callback
+
+
+def post_process():
+    pass
+
+
+def mape_m(actual, pred):
+    return np.mean(np.abs((actual - pred) / actual)) * 100
+
+
+def predict(setting):
+    model = setting['model']
+    x_test = setting['x_test']
+    y_test = setting['y_test']
+    sc = setting['sc']
+    predicted = model.predict(x_test)
+    predicted = sc.inverse_transform(predicted)
+    real = sc.inverse_transform(y_test)
+
+    return predicted, real
+
+
+def evaluate(predicted, real):
+    mse = mean_squared_error(predicted, real)
+    rmse = math.sqrt(mean_squared_error(predicted, real))
+    mae = mean_absolute_error(predicted, real)
+
+    mape = mean_absolute_percentage_error(predicted, real)
+    r2 = r2_score(predicted, real)
+    return mse, rmse, mae, mape, r2
+
+
+# if __name__ == '__main__':
+#     preprocess(setting)
+#     train(setting)
+#     predicted, real = predict(setting)
+#     mse, rmse, mae, mape, r2 = evaluate(predicted, real)
+#     print(f"mse: {mse}, rmse: {rmse}, mae: {mae}, mape: {mape}, r2: {r2}")
